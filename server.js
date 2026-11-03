@@ -6,6 +6,7 @@
  *  - YouTube Live Stream Auto-Resolver & Clip Generator
  *  - Chatbot Webhook for Nightbot / StreamElements / Botrix (!clip $(urlfetch ...))
  *  - Instant YouTube Cued Embed + Optional FFmpeg MP4 Slicing
+ *  - Discord Webhook Logging with embeds, previews & timestamps
  *  - Public Clip Viewer API (No auth required for chat viewers)
  *  - Authenticated CMS Studio API (CORS + API Key protected)
  *  - Atomic JSON File Database with zero database setup required
@@ -60,6 +61,69 @@ function writeClips(clips) {
   }
 }
 
+// ============================================================
+// DISCORD WEBHOOK LOGGING
+// ============================================================
+async function sendDiscordLog({ type = 'info', title, description, fields = [], imageUrl, url }) {
+  const webhookUrl = 
+    process.env.DISCORD_CLIPS_WEBHOOK_URL || 
+    process.env.DISCORD_LOG_WEBHOOK_URL || 
+    process.env.DISCORD_WEBHOOK_URL;
+
+  if (!webhookUrl || typeof webhookUrl !== 'string' || !webhookUrl.startsWith('http')) {
+    return;
+  }
+
+  const botName = process.env.DISCORD_BOT_NAME || 'Archon Clipping Engine';
+  const botAvatar = process.env.DISCORD_BOT_AVATAR || `${FRONTEND_URL}/logo.png`;
+
+  // Colors: Archon Red (#DC2626 = 14427686), Green (#10B981 = 1096065), Amber (#F59E0B = 16098851), Red (#EF4444 = 15680324)
+  let color = 14427686;
+  if (type === 'success') color = 1096065;
+  if (type === 'error') color = 15680324;
+  if (type === 'warn') color = 16098851;
+
+  const embed = {
+    title: title || 'Archon Clipping Log',
+    url: url || undefined,
+    description: description || undefined,
+    color,
+    author: {
+      name: 'Team Archon CMS',
+      icon_url: botAvatar,
+      url: FRONTEND_URL
+    },
+    fields: (fields || []).filter(f => f && f.name && f.value).map(f => ({
+      name: String(f.name),
+      value: String(f.value),
+      inline: Boolean(f.inline)
+    })),
+    footer: {
+      text: 'Archon Clipping Engine • VPS System Log',
+      icon_url: botAvatar
+    },
+    timestamp: new Date().toISOString()
+  };
+
+  if (imageUrl) {
+    embed.image = { url: imageUrl };
+  }
+
+  try {
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: botName,
+        avatar_url: botAvatar,
+        embeds: [embed]
+      })
+    });
+  } catch (err) {
+    console.error('[Discord Log Error]', err.message);
+  }
+}
+
 // CORS Configuration
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://cms.teamarchon.in,http://localhost:3000,http://localhost:5173')
   .split(',')
@@ -111,8 +175,8 @@ function rateLimiter(req, res, next) {
 function authenticateApiKey(req, res, next) {
   const token = 
     req.headers['x-api-key'] || 
-    req.query.secret || 
-    req.body?.secret ||
+    req.query.api_key || 
+    req.query.apiKey || 
     req.headers.authorization?.replace(/^Bearer\s+/i, '');
 
   if (!token || token !== API_KEY) {
@@ -146,7 +210,9 @@ async function resolveYouTubeTarget(channelOrUrl) {
         title = data.title || title;
         author = data.author_name || author;
       }
-    } catch (e) {}
+    } catch (e) {
+      // Fallback
+    }
 
     return {
       videoId,
@@ -158,33 +224,44 @@ async function resolveYouTubeTarget(channelOrUrl) {
     };
   }
 
-  // 2. Resolve via channel handle: @handle/live
-  const cleanHandle = input.replace(/^@/, '').replace(/^https?:\/\/(?:www\.)?youtube\.com\/@?/, '').split(/[\/?#]/)[0];
-  const liveTargetUrl = `https://www.youtube.com/@${cleanHandle}/live`;
+  // 2. Resolve handle (e.g. "@handle") via YouTube public live redirect
+  const cleanHandle = input.startsWith('@') ? input : `@${input}`;
+  const liveUrlCandidate = `https://www.youtube.com/${cleanHandle}/live`;
 
   try {
-    const res = await fetch(liveTargetUrl, {
+    const response = await fetch(liveUrlCandidate, {
+      redirect: 'follow',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9'
-      },
-      redirect: 'follow'
+      }
     });
 
-    const html = await res.text();
-    const finalUrl = res.url || '';
+    const finalUrl = response.url;
+    const finalMatch = finalUrl.match(/(?:v=|live\/)([\w-]{11})/);
 
-    // Extract videoId from canonical URL or HTML payload
-    const match = finalUrl.match(/watch\?v=([\w-]{11})/) || html.match(/"videoId":"([\w-]{11})"/);
-    const videoId = match ? match[1] : null;
+    let videoId = null;
+    if (finalMatch) {
+      videoId = finalMatch[1];
+    } else {
+      const html = await response.text();
+      const canonicalMatch = html.match(/<link\s+rel="canonical"\s+href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
+      const videoIdMatch = html.match(/"videoId":"([\w-]{11})"/);
+      videoId = (canonicalMatch && canonicalMatch[1]) || (videoIdMatch && videoIdMatch[1]);
+    }
 
     if (!videoId) {
       return null;
     }
 
-    // Extract title & author
-    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/) || html.match(/"title":"([^"]+)"/);
-    const title = titleMatch ? titleMatch[1] : `Live Stream by @${cleanHandle}`;
+    let title = `${cleanHandle} Live Clip`;
+    try {
+      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+      if (oembedRes.ok) {
+        const odata = await oembedRes.json();
+        title = odata.title || title;
+      }
+    } catch (_) {}
 
     return {
       videoId,
@@ -195,31 +272,13 @@ async function resolveYouTubeTarget(channelOrUrl) {
       isLive: true
     };
   } catch (err) {
-    console.warn('[YouTube Resolver] Failed to resolve live channel:', err.message);
+    console.error(`[YouTube Resolver] Error resolving handle ${cleanHandle}:`, err.message);
     return null;
   }
 }
 
-/**
- * Optional background worker: If FFmpeg is installed on the VPS, slice the exact MP4
- */
-function attemptFfmpegSlice(videoId, startTime, duration, outputFilename) {
-  const outputPath = path.join(CLIPS_DIR, outputFilename);
-  // Non-blocking check for ffmpeg
-  const proc = spawn('ffmpeg', ['-version']);
-  proc.on('error', () => {
-    // FFmpeg not available on this system; fallback to interactive embed
-  });
-  proc.on('close', (code) => {
-    if (code === 0) {
-      console.log(`[FFmpeg] Slicing YouTube clip: ${outputFilename}...`);
-      // Note: yt-dlp + ffmpeg pipeline can be invoked here on the VPS
-    }
-  });
-}
-
 // ============================================================
-// ROUTES
+// API ROUTES
 // ============================================================
 
 // 1. Health & VPS Monitor
@@ -246,12 +305,27 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
   const duration = Math.min(Math.max(isNaN(rawDuration) ? 30 : rawDuration, 10), 60);
 
   if (!channel) {
+    sendDiscordLog({
+      type: 'warn',
+      title: '⚠️ Clip Rejected: Missing Channel',
+      description: `Clip command called by @${user} without channel parameter.`
+    }).catch(() => {});
     return res.status(400).send('Error: Missing channel parameter. Usage: !clip $(urlfetch https://vps/api/webhook/youtube?channel=@handle&user=$(user))');
   }
 
   // Resolve active YouTube stream
   const target = await resolveYouTubeTarget(channel);
   if (!target || !target.videoId) {
+    sendDiscordLog({
+      type: 'error',
+      title: `⚠️ Live Clip Failed: ${channel}`,
+      description: `Could not resolve an active live stream for **${channel}**.`,
+      fields: [
+        { name: 'Channel / Handle', value: channel, inline: true },
+        { name: 'Requested By', value: `@${user}`, inline: true },
+        { name: 'Reason', value: 'Stream offline or invalid handle', inline: false }
+      ]
+    }).catch(() => {});
     return res.status(404).send(`Could not find an active YouTube live stream for "${channel}". Make sure the channel is currently live.`);
   }
 
@@ -291,6 +365,22 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
   const clips = readClips();
   clips.unshift(newClip);
   writeClips(clips);
+
+  // Send Discord webhook log notification
+  sendDiscordLog({
+    type: 'success',
+    title: `🎬 New Live Clip: ${newClip.title}`,
+    url: clipWatchUrl,
+    description: `A stream highlight was captured by **@${user}** on YouTube Live.`,
+    imageUrl: target.thumbnailUrl,
+    fields: [
+      { name: 'Streamer', value: `@${target.author}`, inline: true },
+      { name: 'Clipped By', value: `@${user}`, inline: true },
+      { name: 'Duration', value: `${duration}s`, inline: true },
+      { name: 'Watch Clip', value: `[Open on Archon CMS](${clipWatchUrl})`, inline: false },
+      { name: 'Original Stream', value: `[YouTube Live](${target.liveUrl})`, inline: false }
+    ]
+  }).catch(() => {});
 
   // Return clean plain text for Nightbot chat
   const isJson = req.headers.accept?.includes('application/json') || req.query.format === 'json';
@@ -345,6 +435,20 @@ app.post('/api/youtube/capture', authenticateApiKey, async (req, res) => {
   const clips = readClips();
   clips.unshift(newClip);
   writeClips(clips);
+
+  // Send Discord webhook log
+  sendDiscordLog({
+    type: 'success',
+    title: `🎬 Studio Clip: ${newClip.title}`,
+    url: clipWatchUrl,
+    description: `A live clip was captured manually from the Archon CMS Studio.`,
+    imageUrl: target.thumbnailUrl,
+    fields: [
+      { name: 'Streamer', value: `@${target.author}`, inline: true },
+      { name: 'Duration', value: `${duration}s`, inline: true },
+      { name: 'Watch Clip', value: `[Open on Archon CMS](${clipWatchUrl})`, inline: false }
+    ]
+  }).catch(() => {});
 
   res.status(201).json({ success: true, clip: newClip });
 });
@@ -418,4 +522,16 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(` Public Clip API: /api/public/clip/:id`);
   console.log(` Health Status: http://0.0.0.0:${PORT}/health`);
   console.log(`===============================================`);
+
+  // Discord boot notification
+  sendDiscordLog({
+    type: 'info',
+    title: '🟢 Archon Clipping Engine Online',
+    description: 'VPS backend service is online and listening for webhook triggers.',
+    fields: [
+      { name: 'Port', value: String(PORT), inline: true },
+      { name: 'Public Host', value: PUBLIC_BASE_URL, inline: true },
+      { name: 'CORS Origin', value: FRONTEND_URL, inline: true }
+    ]
+  }).catch(() => {});
 });
