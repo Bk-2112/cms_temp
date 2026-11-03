@@ -131,11 +131,12 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://cms.teamarchon.i
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow server-to-server, chat bots, or requests from CMS origins
-    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+    // Allow public clip viewers, server-to-server, chat bots, or requests from CMS origins
+    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*') || origin.endsWith('teamarchon.in')) {
       return callback(null, true);
     }
-    return callback(new Error('Blocked by CORS policy'));
+    // Allow public viewing from anywhere
+    return callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
@@ -189,6 +190,18 @@ function authenticateApiKey(req, res, next) {
 // YOUTUBE RESOLUTION HELPERS
 // ============================================================
 
+// Helper: Format seconds to HH:MM:SS or MM:SS
+function formatTimestamp(sec) {
+  if (isNaN(sec) || sec <= 0) return '00:00';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 /**
  * Resolves a YouTube channel handle, live URL, or video ID to active live stream details
  */
@@ -196,40 +209,22 @@ async function resolveYouTubeTarget(channelOrUrl) {
   if (!channelOrUrl) return null;
   const input = channelOrUrl.trim();
 
+  let targetUrl = '';
+  let cleanHandle = '';
+
   // 1. Check if user provided direct video ID or URL
   const directMatch = input.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|live\/|shorts\/))([\w-]{11})/i);
   if (directMatch) {
-    const videoId = directMatch[1];
-    let title = 'YouTube Live Clip';
-    let author = 'YouTube Creator';
-
-    try {
-      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-      if (oembedRes.ok) {
-        const data = await oembedRes.json();
-        title = data.title || title;
-        author = data.author_name || author;
-      }
-    } catch (e) {
-      // Fallback
-    }
-
-    return {
-      videoId,
-      title,
-      author,
-      thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-      liveUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      isLive: true
-    };
+    targetUrl = `https://www.youtube.com/watch?v=${directMatch[1]}`;
+    cleanHandle = 'YouTube Streamer';
+  } else {
+    // 2. Resolve handle (e.g. "@handle") via YouTube public live redirect
+    cleanHandle = input.startsWith('@') ? input : `@${input}`;
+    targetUrl = `https://www.youtube.com/${cleanHandle}/live`;
   }
 
-  // 2. Resolve handle (e.g. "@handle") via YouTube public live redirect
-  const cleanHandle = input.startsWith('@') ? input : `@${input}`;
-  const liveUrlCandidate = `https://www.youtube.com/${cleanHandle}/live`;
-
   try {
-    const response = await fetch(liveUrlCandidate, {
+    const response = await fetch(targetUrl, {
       redirect: 'follow',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -239,12 +234,10 @@ async function resolveYouTubeTarget(channelOrUrl) {
 
     const finalUrl = response.url;
     const finalMatch = finalUrl.match(/(?:v=|live\/)([\w-]{11})/);
+    const html = await response.text();
 
-    let videoId = null;
-    if (finalMatch) {
-      videoId = finalMatch[1];
-    } else {
-      const html = await response.text();
+    let videoId = finalMatch ? finalMatch[1] : null;
+    if (!videoId) {
       const canonicalMatch = html.match(/<link\s+rel="canonical"\s+href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
       const videoIdMatch = html.match(/"videoId":"([\w-]{11})"/);
       videoId = (canonicalMatch && canonicalMatch[1]) || (videoIdMatch && videoIdMatch[1]);
@@ -254,14 +247,28 @@ async function resolveYouTubeTarget(channelOrUrl) {
       return null;
     }
 
+    // Extract real stream title from HTML
     let title = `${cleanHandle} Live Clip`;
-    try {
-      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-      if (oembedRes.ok) {
-        const odata = await oembedRes.json();
-        title = odata.title || title;
-      }
-    } catch (_) {}
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+    if (titleMatch && titleMatch[1]) {
+      title = titleMatch[1].replace(/\s*-\s*YouTube$/i, '').trim();
+    }
+
+    // Extract channel owner name if available
+    const ownerMatch = html.match(/"ownerChannelName":"([^"]+)"/);
+    if (ownerMatch && ownerMatch[1]) {
+      cleanHandle = ownerMatch[1];
+    }
+
+    // Extract start time from live stream metadata
+    const startMatch = html.match(/"startTimestamp":"([^"]+)"/);
+    const liveBroadcast = html.match(/"actualStartTime":"([^"]+)"/);
+    const publishMatch = html.match(/"publishDate":"([^"]+)"/);
+    const startTimeStr = (startMatch && startMatch[1]) || (liveBroadcast && liveBroadcast[1]) || (publishMatch && publishMatch[1]) || null;
+
+    // Check if YouTube allows embedding
+    const notEmbeddable = html.includes('"playableInEmbed":false') || html.includes('"isEmbeddable":false');
+    const isEmbeddable = !notEmbeddable;
 
     return {
       videoId,
@@ -269,6 +276,8 @@ async function resolveYouTubeTarget(channelOrUrl) {
       author: cleanHandle,
       thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
       liveUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      startTimeStr,
+      isEmbeddable,
       isLive: true
     };
   } catch (err) {
@@ -337,18 +346,45 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
   // Public watch URL on Team Archon CMS
   const clipWatchUrl = `${FRONTEND_URL}/clip/${clipId}`;
 
+  // Calculate stream offset and live timestamps
+  const reqTimestamp = Number(req.query.timestamp) || Number(req.body?.timestamp) || Date.now();
+  let elapsedSec = 0;
+  let clipStartSec = 0;
+
+  if (target.startTimeStr) {
+    const streamStartMs = new Date(target.startTimeStr).getTime();
+    elapsedSec = Math.max(0, Math.floor((reqTimestamp - streamStartMs) / 1000));
+    clipStartSec = Math.max(0, elapsedSec - duration);
+  }
+
+  const clipTimestampUrl = clipStartSec > 0 
+    ? `https://www.youtube.com/watch?v=${target.videoId}&t=${clipStartSec}s` 
+    : target.liveUrl;
+
+  const currentLiveUrl = elapsedSec > 0 
+    ? `https://www.youtube.com/watch?v=${target.videoId}&t=${elapsedSec}s` 
+    : target.liveUrl;
+
+  const formattedClipTime = formatTimestamp(clipStartSec);
+  const formattedCurrentTime = formatTimestamp(elapsedSec);
+
   const newClip = {
     id: clipId,
     title: customTitle || `${target.title} (Clipped by @${user})`,
     description: `YouTube Live Stream clip captured by @${user}`,
     sourcePlatform: 'youtube',
-    sourceUrl: target.liveUrl,
-    videoUrl: target.liveUrl,
+    sourceUrl: clipTimestampUrl,
+    videoUrl: clipTimestampUrl,
     videoId: target.videoId,
     thumbnailUrl: target.thumbnailUrl,
     duration,
-    startTime: 0,
-    endTime: duration,
+    startTime: clipStartSec,
+    endTime: elapsedSec > 0 ? elapsedSec : duration,
+    offsetSeconds: clipStartSec,
+    currentLiveTimeSeconds: elapsedSec,
+    timestampUrl: clipTimestampUrl,
+    currentTimeUrl: currentLiveUrl,
+    isEmbeddable: target.isEmbeddable,
     aspectRatio: '16:9',
     status: 'ready',
     viralScore: Math.floor(Math.random() * 15) + 85,
@@ -359,7 +395,7 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
     aiHookText: `INSANE MOMENT CLIPPED BY @${user.toUpperCase()} 🔥`,
     clippedBy: user,
     clipPageUrl: clipWatchUrl,
-    embedUrl: `https://www.youtube-nocookie.com/embed/${target.videoId}?autoplay=1`,
+    embedUrl: `https://www.youtube.com/embed/${target.videoId}?autoplay=1${clipStartSec > 0 ? `&start=${clipStartSec}` : ''}`,
     createdAt: now.toISOString()
   };
 
@@ -368,7 +404,7 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
   clips.unshift(newClip);
   writeClips(clips);
 
-  // Send Discord webhook log notification
+  // Send Discord webhook log notification with clip URL and current time URL!
   sendDiscordLog({
     type: 'success',
     title: `🎬 New Live Clip: ${newClip.title}`,
@@ -379,8 +415,25 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
       { name: 'Streamer', value: `@${target.author}`, inline: true },
       { name: 'Clipped By', value: `@${user}`, inline: true },
       { name: 'Duration', value: `${duration}s`, inline: true },
-      { name: 'Watch Clip', value: `[Open on Archon CMS](${clipWatchUrl})`, inline: false },
-      { name: 'Original Stream', value: `[YouTube Live](${target.liveUrl})`, inline: false }
+      { 
+        name: '⏱️ Clip Timestamp', 
+        value: clipStartSec > 0 
+          ? `[▶ Watch at Clip Moment (${formattedClipTime})](${clipTimestampUrl})` 
+          : `[Watch Stream](${target.liveUrl})`, 
+        inline: true 
+      },
+      { 
+        name: '🔴 Current Live Time', 
+        value: elapsedSec > 0 
+          ? `[▶ Jump to Current Time (${formattedCurrentTime})](${currentLiveUrl})` 
+          : `[Watch Stream](${target.liveUrl})`, 
+        inline: true 
+      },
+      { 
+        name: '🌐 Archon CMS Clip Page', 
+        value: `[Open Public Clip Viewer](${clipWatchUrl})`, 
+        inline: false 
+      }
     ]
   }).catch(() => {});
 
@@ -390,7 +443,7 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
     return res.json({ success: true, clip: newClip });
   }
 
-  return res.send(`🎬 Clip captured by @${user}! Watch: ${clipWatchUrl}`);
+  return res.send(`🎬 Clip captured by @${user}! Watch: ${clipWatchUrl} | YouTube: ${clipTimestampUrl}`);
 });
 
 // 3. CMS Manual Capture API: Trigger YouTube clip from Frontend
@@ -408,18 +461,44 @@ app.post('/api/youtube/capture', authenticateApiKey, async (req, res) => {
   const clipId = `yt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const clipWatchUrl = `${FRONTEND_URL}/clip/${clipId}`;
 
+  // Calculate stream offset and live timestamps
+  let elapsedSec = 0;
+  let clipStartSec = 0;
+
+  if (target.startTimeStr) {
+    const streamStartMs = new Date(target.startTimeStr).getTime();
+    elapsedSec = Math.max(0, Math.floor((Date.now() - streamStartMs) / 1000));
+    clipStartSec = Math.max(0, elapsedSec - Number(duration));
+  }
+
+  const clipTimestampUrl = clipStartSec > 0 
+    ? `https://www.youtube.com/watch?v=${target.videoId}&t=${clipStartSec}s` 
+    : target.liveUrl;
+
+  const currentLiveUrl = elapsedSec > 0 
+    ? `https://www.youtube.com/watch?v=${target.videoId}&t=${elapsedSec}s` 
+    : target.liveUrl;
+
+  const formattedClipTime = formatTimestamp(clipStartSec);
+  const formattedCurrentTime = formatTimestamp(elapsedSec);
+
   const newClip = {
     id: clipId,
     title: title || `${target.title} (Live Capture)`,
     description: 'Captured directly from Archon CMS Studio',
     sourcePlatform: 'youtube',
-    sourceUrl: target.liveUrl,
-    videoUrl: target.liveUrl,
+    sourceUrl: clipTimestampUrl,
+    videoUrl: clipTimestampUrl,
     videoId: target.videoId,
     thumbnailUrl: target.thumbnailUrl,
     duration: Number(duration),
-    startTime: 0,
-    endTime: Number(duration),
+    startTime: clipStartSec,
+    endTime: elapsedSec > 0 ? elapsedSec : Number(duration),
+    offsetSeconds: clipStartSec,
+    currentLiveTimeSeconds: elapsedSec,
+    timestampUrl: clipTimestampUrl,
+    currentTimeUrl: currentLiveUrl,
+    isEmbeddable: target.isEmbeddable,
     aspectRatio: '16:9',
     status: 'ready',
     viralScore: 94,
@@ -430,7 +509,7 @@ app.post('/api/youtube/capture', authenticateApiKey, async (req, res) => {
     aiHookText: 'INSTANT STUDIO CAPTURE 🔥',
     clippedBy: 'Studio Editor',
     clipPageUrl: clipWatchUrl,
-    embedUrl: `https://www.youtube-nocookie.com/embed/${target.videoId}?autoplay=1`,
+    embedUrl: `https://www.youtube.com/embed/${target.videoId}?autoplay=1${clipStartSec > 0 ? `&start=${clipStartSec}` : ''}`,
     createdAt: new Date().toISOString()
   };
 
@@ -448,7 +527,25 @@ app.post('/api/youtube/capture', authenticateApiKey, async (req, res) => {
     fields: [
       { name: 'Streamer', value: `@${target.author}`, inline: true },
       { name: 'Duration', value: `${duration}s`, inline: true },
-      { name: 'Watch Clip', value: `[Open on Archon CMS](${clipWatchUrl})`, inline: false }
+      { 
+        name: '⏱️ Clip Timestamp', 
+        value: clipStartSec > 0 
+          ? `[▶ Watch at Clip Moment (${formattedClipTime})](${clipTimestampUrl})` 
+          : `[Watch Stream](${target.liveUrl})`, 
+        inline: true 
+      },
+      { 
+        name: '🔴 Current Live Time', 
+        value: elapsedSec > 0 
+          ? `[▶ Jump to Current Time (${formattedCurrentTime})](${currentLiveUrl})` 
+          : `[Watch Stream](${target.liveUrl})`, 
+        inline: true 
+      },
+      { 
+        name: '🌐 Archon CMS Clip Page', 
+        value: `[Open Public Clip Viewer](${clipWatchUrl})`, 
+        inline: false 
+      }
     ]
   }).catch(() => {});
 
