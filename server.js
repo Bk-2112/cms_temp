@@ -298,8 +298,10 @@ app.get('/health', (req, res) => {
 // 2. Chatbot Webhook: YouTube Live (!clip command)
 // Works with Nightbot / StreamElements $(urlfetch ...) via GET or POST
 app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimiter, async (req, res) => {
-  const channel = req.query.handle || req.query.channel || req.body?.handle || req.body?.channel;
-  const user = req.query.user || req.body?.user || 'Viewer';
+  const rawChannel = req.query.handle || req.query.channel || req.body?.handle || req.body?.channel;
+  const channel = rawChannel ? (String(rawChannel).trim().startsWith('@') ? String(rawChannel).trim() : `@${String(rawChannel).trim()}`) : '';
+  const rawUser = req.query.user || req.body?.user || 'Viewer';
+  const user = String(rawUser).replace(/^@+/, '').trim() || 'Viewer';
   const customTitle = req.query.msg || req.query.title || req.query.query || req.body?.msg || req.body?.title;
   const rawDuration = parseInt(req.query.duration || req.body?.duration || '30', 10);
   const duration = Math.min(Math.max(isNaN(rawDuration) ? 30 : rawDuration, 10), 60);
