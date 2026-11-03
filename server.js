@@ -238,7 +238,7 @@ app.get('/health', (req, res) => {
 
 // 2. Chatbot Webhook: YouTube Live (!clip command)
 // Works with Nightbot / StreamElements $(urlfetch ...) via GET or POST
-app.all('/api/webhook/youtube', rateLimiter, async (req, res) => {
+app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimiter, async (req, res) => {
   const channel = req.query.channel || req.body?.channel;
   const user = req.query.user || req.body?.user || 'Viewer';
   const customTitle = req.query.title || req.body?.title;
