@@ -82,6 +82,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Serve static MP4 clip files with HTTP range streaming
 app.use('/clips', express.static(CLIPS_DIR));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Rate Limiter
 const rateLimitMap = new Map();
