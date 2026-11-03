@@ -310,23 +310,23 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
       title: '⚠️ Clip Rejected: Missing Channel',
       description: `Clip command called by @${user} without channel parameter.`
     }).catch(() => {});
-    return res.status(400).send('Error: Missing channel parameter. Usage: !clip $(urlfetch https://vps/api/webhook/youtube?channel=@handle&user=$(user))');
+    return res.status(200).send(`⚠️ Error: Missing channel parameter in !clip command.`);
   }
 
   // Resolve active YouTube stream
   const target = await resolveYouTubeTarget(channel);
   if (!target || !target.videoId) {
     sendDiscordLog({
-      type: 'error',
+      type: 'warn',
       title: `⚠️ Live Clip Failed: ${channel}`,
       description: `Could not resolve an active live stream for **${channel}**.`,
       fields: [
         { name: 'Channel / Handle', value: channel, inline: true },
         { name: 'Requested By', value: `@${user}`, inline: true },
-        { name: 'Reason', value: 'Stream offline or invalid handle', inline: false }
+        { name: 'Reason', value: 'Stream offline or channel not currently live on YouTube', inline: false }
       ]
     }).catch(() => {});
-    return res.status(404).send(`Could not find an active YouTube live stream for "${channel}". Make sure the channel is currently live.`);
+    return res.status(200).send(`⚠️ @${user}, ${channel} is not currently live on YouTube! Clips can only be captured during an active live stream.`);
   }
 
   const clipId = `yt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
