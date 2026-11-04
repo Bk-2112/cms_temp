@@ -315,7 +315,7 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
   const user = String(rawUser).replace(/^@+/, '').trim() || 'Viewer';
   const customTitle = req.query.msg || req.query.title || req.query.query || req.body?.msg || req.body?.title;
   const rawDuration = parseInt(req.query.duration || req.body?.duration || '30', 10);
-  const duration = Math.min(Math.max(isNaN(rawDuration) ? 30 : rawDuration, 10), 60);
+  const duration = Math.min(Math.max(isNaN(rawDuration) ? 30 : rawDuration, 5), 180);
 
   if (!channel) {
     sendDiscordLog({
