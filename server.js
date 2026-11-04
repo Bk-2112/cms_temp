@@ -500,6 +500,23 @@ app.delete(['/api/whitelist/:discord_id', '/api/whitelist'], (req, res) => {
   res.json({ success: true, removed: cleanId });
 });
 
+app.post('/api/whitelist/sync-login', (req, res) => {
+  const { discord_id, username, avatar } = req.body || {};
+  if (!discord_id) return res.status(400).json({ error: 'Missing discord_id' });
+  const cleanId = String(discord_id).trim();
+  const users = readWhitelist();
+  const idx = users.findIndex(u => u.discord_id === cleanId);
+  if (idx >= 0) {
+    if (username) users[idx].username = String(username).trim();
+    if (avatar) users[idx].avatar = String(avatar).trim();
+    users[idx].has_logged_in = true;
+    users[idx].updated_at = new Date().toISOString();
+    writeWhitelist(users);
+    return res.json({ success: true, user: users[idx] });
+  }
+  res.json({ success: false, message: 'User not in whitelist' });
+});
+
 // 2. Chatbot Webhook: YouTube Live (!clip command)
 // Works with Nightbot / StreamElements $(urlfetch ...) via GET or POST
 app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimiter, async (req, res) => {
