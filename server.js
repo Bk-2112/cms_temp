@@ -25,6 +25,90 @@ const API_KEY = process.env.CLIPPING_API_KEY || 'archon_secret_clip_token_2026';
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://cms.teamarchon.in').replace(/\/+$/, '');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://obsnaxcxeaqeluvqwaos.supabase.co';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ic25heGN4ZWFxZWx1dnF3YW9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYwMzc4NDksImV4cCI6MjEwMTYxMzg0OX0._3yZp1bBS3OvCeioyWcVR1cIfyPQk52rVmWoihwKzo8';
+
+async function syncClipToSupabase(clip) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
+  try {
+    const payload = {
+      id: clip.id,
+      title: clip.title,
+      description: clip.description,
+      source_platform: clip.sourcePlatform || 'youtube',
+      source_url: clip.sourceUrl,
+      video_url: clip.videoUrl,
+      video_id: clip.videoId,
+      thumbnail_url: clip.thumbnailUrl,
+      duration: clip.duration || 30,
+      start_time: clip.startTime || 0,
+      end_time: clip.endTime || 30,
+      offset_seconds: clip.offsetSeconds || 0,
+      current_live_time_seconds: clip.currentLiveTimeSeconds || 0,
+      timestamp_url: clip.timestampUrl,
+      current_time_url: clip.currentTimeUrl,
+      is_embeddable: clip.isEmbeddable ?? true,
+      aspect_ratio: clip.aspectRatio || '16:9',
+      status: clip.status || 'ready',
+      viral_score: clip.viralScore || 90,
+      tags: clip.tags || [],
+      streamer: clip.streamer,
+      game: clip.game || 'Live Stream',
+      views: clip.views || 1,
+      clipped_by: clip.clippedBy || 'Viewer',
+      clip_page_url: clip.clipPageUrl,
+      embed_url: clip.embedUrl,
+      created_at: clip.createdAt || new Date().toISOString()
+    };
+
+    await fetch(`${SUPABASE_URL}/rest/v1/clips`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      body: JSON.stringify(payload)
+    });
+  } catch (err) {
+    console.warn('[Supabase Sync Warning]', err.message);
+  }
+}
+
+async function deleteClipFromSupabase(clipId) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !clipId) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/clips?id=eq.${encodeURIComponent(clipId)}`, {
+      method: 'DELETE',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+      }
+    });
+  } catch (err) {
+    console.warn('[Supabase Delete Warning]', err.message);
+  }
+}
+
+async function updateClipInSupabase(clipId, updates) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !clipId) return;
+  try {
+    const payload = { ...updates, updated_at: new Date().toISOString() };
+    await fetch(`${SUPABASE_URL}/rest/v1/clips?id=eq.${encodeURIComponent(clipId)}`, {
+      method: 'PATCH',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+  } catch (err) {
+    console.warn('[Supabase Update Warning]', err.message);
+  }
+}
+
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'clips.json');
 const CLIPS_DIR = path.join(__dirname, 'public', 'clips');
@@ -515,6 +599,8 @@ app.all(['/api/webhook/youtube', '/api/webhook/clip', '/api/webhook'], rateLimit
   const clips = readClips();
   clips.unshift(newClip);
   writeClips(clips);
+  syncClipToSupabase(newClip);
+  syncClipToSupabase(newClip);
 
   // Send Discord webhook log notification with clip URL and current time URL!
   sendDiscordLog({
@@ -628,6 +714,7 @@ app.post('/api/youtube/capture', authenticateApiKey, async (req, res) => {
   const clips = readClips();
   clips.unshift(newClip);
   writeClips(clips);
+  syncClipToSupabase(newClip);
 
   // Send Discord webhook log
   sendDiscordLog({
@@ -734,6 +821,7 @@ app.put('/api/clips/:id', authenticateApiKey, (req, res) => {
   const oldTitle = clips[idx].title;
   clips[idx] = { ...clips[idx], ...updates, updatedAt: new Date().toISOString() };
   writeClips(clips);
+  updateClipInSupabase(id, updates);
 
   if (updates.title && updates.title !== oldTitle) {
     sendDiscordLog({
@@ -764,6 +852,7 @@ app.delete('/api/clips/:id', authenticateApiKey, (req, res) => {
   }
 
   writeClips(filtered);
+  deleteClipFromSupabase(id);
 
   if (targetClip) {
     sendDiscordLog({
