@@ -40,6 +40,11 @@ if (!fs.existsSync(DATA_FILE)) {
   fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2), 'utf-8');
 }
 
+const WHITELIST_FILE = path.join(DATA_DIR, 'whitelist.json');
+if (!fs.existsSync(WHITELIST_FILE)) {
+  fs.writeFileSync(WHITELIST_FILE, JSON.stringify([], null, 2), 'utf-8');
+}
+
 // Memory-friendly database helpers
 function readClips() {
   try {
@@ -58,6 +63,26 @@ function writeClips(clips) {
     fs.renameSync(tempFile, DATA_FILE);
   } catch (err) {
     console.error('[Storage] Error saving clips:', err.message);
+  }
+}
+
+function readWhitelist() {
+  try {
+    const raw = fs.readFileSync(WHITELIST_FILE, 'utf-8');
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error('[Storage] Error reading whitelist:', err.message);
+    return [];
+  }
+}
+
+function writeWhitelist(users) {
+  try {
+    const tempFile = `${WHITELIST_FILE}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(users, null, 2), 'utf-8');
+    fs.renameSync(tempFile, WHITELIST_FILE);
+  } catch (err) {
+    console.error('[Storage] Error saving whitelist:', err.message);
   }
 }
 
@@ -302,8 +327,93 @@ app.get('/health', (req, res) => {
     ramUsedMB: (memUsage.rss / 1024 / 1024).toFixed(2),
     heapUsedMB: (memUsage.heapUsed / 1024 / 1024).toFixed(2),
     totalClips: readClips().length,
+    totalWhitelistedUsers: readWhitelist().length,
     timestamp: new Date().toISOString()
   });
+});
+
+// 1.5 Whitelist / Authorized Users API (Shared VPS Database Fallback)
+app.get('/api/whitelist', (req, res) => {
+  const users = readWhitelist();
+  const discordId = req.query.discord_id || req.query.discordId;
+  if (discordId) {
+    const clean = String(discordId).trim();
+    const user = users.find(u => u.discord_id === clean && u.is_active);
+    return res.json({ user: user || null, authorized: Boolean(user) });
+  }
+  res.json({ users });
+});
+
+app.post('/api/whitelist', (req, res) => {
+  const { discord_id, username, role = 'creator', notes = '', assigned_creators = [], added_by = 'Owner' } = req.body;
+  if (!discord_id) {
+    return res.status(400).json({ error: 'Missing discord_id' });
+  }
+
+  const cleanId = String(discord_id).trim();
+  const users = readWhitelist();
+  const existingIdx = users.findIndex(u => u.discord_id === cleanId);
+
+  const now = new Date().toISOString();
+  const userRecord = {
+    id: existingIdx >= 0 ? users[existingIdx].id : `usr_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+    discord_id: cleanId,
+    username: (username || '').trim() || `User_${cleanId.slice(-4)}`,
+    role,
+    notes,
+    assigned_creators: Array.isArray(assigned_creators) ? assigned_creators : [],
+    added_by,
+    is_active: true,
+    created_at: existingIdx >= 0 ? users[existingIdx].created_at : now,
+    updated_at: now
+  };
+
+  if (existingIdx >= 0) {
+    users[existingIdx] = userRecord;
+  } else {
+    users.unshift(userRecord);
+  }
+
+  writeWhitelist(users);
+
+  sendDiscordLog({
+    type: 'info',
+    title: `🛡️ Whitelist Updated: @${userRecord.username}`,
+    description: `User **@${userRecord.username}** (\`${userRecord.discord_id}\`) was granted role **${userRecord.role.toUpperCase()}**.`,
+    fields: [
+      { name: 'Discord ID', value: `\`${userRecord.discord_id}\``, inline: true },
+      { name: 'Role', value: userRecord.role.toUpperCase(), inline: true },
+      { name: 'Added By', value: String(userRecord.added_by), inline: true }
+    ]
+  }).catch(() => {});
+
+  res.json({ success: true, user: userRecord });
+});
+
+app.delete(['/api/whitelist/:discord_id', '/api/whitelist'], (req, res) => {
+  const cleanId = String(req.params.discord_id || req.query.discord_id || req.body?.discord_id || '').trim();
+  if (!cleanId) {
+    return res.status(400).json({ error: 'Missing discord_id' });
+  }
+
+  const users = readWhitelist();
+  const removedUser = users.find(u => u.discord_id === cleanId);
+  const filtered = users.filter(u => u.discord_id !== cleanId);
+  writeWhitelist(filtered);
+
+  if (removedUser) {
+    sendDiscordLog({
+      type: 'warn',
+      title: `🚫 User Removed from Whitelist: @${removedUser.username}`,
+      description: `User **@${removedUser.username}** (\`${cleanId}\`) was removed from the CMS whitelist.`,
+      fields: [
+        { name: 'Discord ID', value: `\`${cleanId}\``, inline: true },
+        { name: 'Previous Role', value: removedUser.role.toUpperCase(), inline: true }
+      ]
+    }).catch(() => {});
+  }
+
+  res.json({ success: true, removed: cleanId });
 });
 
 // 2. Chatbot Webhook: YouTube Live (!clip command)
